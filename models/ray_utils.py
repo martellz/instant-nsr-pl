@@ -20,6 +20,37 @@ def get_ray_directions(W, H, fx, fy, cx, cy, use_pixel_centers=True):
     return directions
 
 
+def get_ray_directions_vc(vc, use_pixel_centers=True):
+
+    assert(use_pixel_centers)
+
+    left = vc.left / vc.znear
+    right = vc.right / vc.znear
+    top = vc.top / vc.znear
+    bottom = vc.bottom / vc.znear
+
+    W = vc.width
+    H = vc.height
+
+    fx = W / (right - left)
+    cx = -fx * left
+
+    fy = H / (top - bottom)
+    cy = fy * top
+
+    cx -= 0.5
+    cy -= 0.5
+
+    return get_ray_directions(W, H, fx, fy, cx, cy, use_pixel_centers)
+
+
+def get_c2w(vc):
+    view_mat = vc.view_mat.copy()
+    view_mat[:, 1] = -view_mat[:, 1]
+    view_mat[:, 2] = -view_mat[:, 2]
+    return np.linalg.inv(view_mat)
+
+
 def get_rays(directions, c2w, keepdim=False):
     # Rotate ray directions from camera coordinate to the world coordinate
     # rays_d = directions @ c2w[:, :3].T # (H, W, 3) # slow?

@@ -23,7 +23,7 @@ class NeuSSystem(BaseSystem):
         self.criterions = {
             'psnr': PSNR()
         }
-        self.train_num_samples = self.config.model.train_num_rays * self.config.model.num_samples_per_ray
+        self.train_num_samples = self.config.model.train_num_rays * (self.config.model.num_samples_per_ray + self.config.model.bg_num_samples_per_ray)
         self.train_num_rays = self.config.model.train_num_rays
 
     def on_train_start(self) -> None:
@@ -46,31 +46,52 @@ class NeuSSystem(BaseSystem):
         return self.model(batch['rays'])
     
     def preprocess_data(self, batch, stage):
+        device = self.dataset.all_c2w.device
+
         if 'index' in batch: # validation / testing
             index = batch['index']
         else:
             if self.config.model.batch_image_sampling:
-                index = torch.randint(0, len(self.dataset.all_images), size=(self.train_num_rays,), device=self.dataset.all_images.device)
+                index = torch.randint(0, len(self.dataset.all_images), size=(self.train_num_rays,), device=device)
             else:
-                index = torch.randint(0, len(self.dataset.all_images), size=(1,), device=self.dataset.all_images.device)
+                index = torch.randint(0, len(self.dataset.all_images), size=(1,), device=device)
+
         if stage in ['train']:
             c2w = self.dataset.all_c2w[index]
-            x = torch.randint(
-                0, self.dataset.w, size=(self.train_num_rays,), device=self.dataset.all_images.device
-            )
-            y = torch.randint(
-                0, self.dataset.h, size=(self.train_num_rays,), device=self.dataset.all_images.device
-            )
-            directions = self.dataset.directions[y, x]
+            if type(self.dataset.directions) is list:
+                assert(len(index) == 1)
+                x = torch.randint(
+                    0, self.dataset.ws[index.item()], size=(self.train_num_rays,), device=device
+                )
+                y = torch.randint(
+                    0, self.dataset.hs[index.item()], size=(self.train_num_rays,), device=device
+                )
+                directions = self.dataset.directions[index.item()].to(device)[y, x]
+                rgb = self.dataset.all_images[index.item()].to(device)[y, x].view(-1, self.dataset.all_images[index.item()].shape[-1])
+                fg_mask = None
+            else:
+                x = torch.randint(
+                    0, self.dataset.w, size=(self.train_num_rays,), device=self.dataset.all_images.device
+                )
+                y = torch.randint(
+                    0, self.dataset.h, size=(self.train_num_rays,), device=self.dataset.all_images.device
+                )
+                directions = self.dataset.directions[y, x]
+                rgb = self.dataset.all_images[index, y, x].view(-1, self.dataset.all_images.shape[-1])
+                fg_mask = self.dataset.all_fg_masks[index, y, x].view(-1)
             rays_o, rays_d = get_rays(directions, c2w)
-            rgb = self.dataset.all_images[index, y, x].view(-1, self.dataset.all_images.shape[-1])
-            fg_mask = self.dataset.all_fg_masks[index, y, x].view(-1)
         else:
             c2w = self.dataset.all_c2w[index][0]
-            directions = self.dataset.directions
+            if type(self.dataset.directions) is list:
+                assert(len(index) == 1)
+                directions = self.dataset.directions[index.item()].to(device)
+                rgb = self.dataset.all_images[index.item()].to(device).view(-1, self.dataset.all_images[index.item()].shape[-1])
+                fg_mask = None
+            else:
+                directions = self.dataset.directions
+                rgb = self.dataset.all_images[index].view(-1, self.dataset.all_images.shape[-1])
+                fg_mask = self.dataset.all_fg_masks[index].view(-1)
             rays_o, rays_d = get_rays(directions, c2w)
-            rgb = self.dataset.all_images[index].view(-1, self.dataset.all_images.shape[-1])
-            fg_mask = self.dataset.all_fg_masks[index].view(-1)
         
         rays = torch.cat([rays_o, rays_d], dim=-1)
         
@@ -98,10 +119,11 @@ class NeuSSystem(BaseSystem):
         self.log('train/loss_eikonal', loss_eikonal)
         loss += loss_eikonal * self.C(self.config.system.loss.lambda_eikonal)
         
-        opacity = torch.clamp(out['opacity'], 1.e-3, 1.-1.e-3)
-        loss_mask = binary_cross_entropy(opacity, batch['fg_mask'].float())
-        self.log('train/loss_mask', loss_mask)
-        loss += loss_mask * self.C(self.config.system.loss.lambda_mask)
+        if self.config.system.loss.lambda_mask > 0.0:
+            opacity = torch.clamp(out['opacity'], 1.e-3, 1.-1.e-3)
+            loss_mask = binary_cross_entropy(opacity, batch['fg_mask'].float())
+            self.log('train/loss_mask', loss_mask)
+            loss += loss_mask * self.C(self.config.system.loss.lambda_mask)
 
         losses_model_reg = self.model.regularizations(out)
         for name, value in losses_model_reg.items():
@@ -121,6 +143,15 @@ class NeuSSystem(BaseSystem):
             'loss': loss
         }
     
+
+    def training_epoch_end(self, out):
+        mesh = self.model.isosurface()
+        self.save_mesh(
+            f"it{self.global_step}-{self.config.model.geometry.isosurface.method}{self.config.model.geometry.isosurface.resolution}.obj",
+            mesh['v_pos'],
+            mesh['t_pos_idx'],
+        )
+
     """
     # aggregate outputs from different devices (DP)
     def training_step_end(self, out):

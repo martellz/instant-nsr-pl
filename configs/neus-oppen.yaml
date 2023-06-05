@@ -1,25 +1,24 @@
-name: neus-blender-${dataset.scene}
+name: neus-oppen
 tag: ''
 seed: 42
 
 dataset:
-  name: blender
+  name: oppen
   scene: ???
-  root_dir: ./load/nerf_synthetic/${dataset.scene}
   img_wh:
     - 800
     - 800
-  near_plane: 2.0
-  far_plane: 6.0
+  near_plane: 0.0
+  far_plane: 0.0
   spheric_poses: false
   use_pixel_centers: true
+  cam_sphere_radius: 1.0
+  obj_size: 0.2
   train_split: 'train'
-  val_split: 'val'
-  test_split: 'test'
 
 model:
   name: neus
-  radius: 1.5
+  radius: 1.0
   bg_radius: 200
   num_samples_per_ray: 1024
   bg_num_samples_per_ray: 128
@@ -27,7 +26,7 @@ model:
   max_train_num_rays: 4096
   grid_prune: true
   dynamic_ray_sampling: true
-  batch_image_sampling: true
+  batch_image_sampling: false
   randomized: true
   ray_chunk: 4096
   init_variance: 0.3
@@ -37,7 +36,7 @@ model:
     radius: ${model.radius}
     feature_dim: 13
     sdf_activation: none
-    sdf_bias: -0.5
+    sdf_bias: 0.
     grad_type: analytic
     isosurface:
       method: mc
@@ -115,7 +114,7 @@ system:
   name: neus-system
   loss:
     lambda_rgb: 1.
-    lambda_mask: 0.1
+    lambda_mask: 0.0
     lambda_eikonal: 0.1
   optimizer:
     name: Adam
@@ -133,22 +132,12 @@ system:
       bg_geometry:
           lr: 0.01
       bg_texture:
-        lr: 0.01
-  warmup_steps: 2000
+          lr: 0.01
   scheduler:
-    name: SequentialLR
+    name: ExponentialLR
     interval: step
-    milestones:
-      - ${system.warmup_steps}
-    schedulers:
-      - name: LinearLR # linear warm-up in the first system.warmup_steps steps
-        args:
-          start_factor: 0.01
-          end_factor: 1.0
-          total_iters: ${system.warmup_steps}
-      - name: ExponentialLR
-        args:
-          gamma: ${calc_exp_lr_decay_rate:0.1,${sub:${trainer.max_steps},${system.warmup_steps}}}
+    args:
+      gamma: ${calc_exp_lr_decay_rate:0.1,${trainer.max_steps}}    
 
 checkpoint:
   save_top_k: -1

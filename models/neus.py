@@ -6,7 +6,7 @@ import models
 from models.base import BaseModel
 from models.utils import chunk_batch
 from systems.utils import update_module_step
-from nerfacc import ContractionType, OccupancyGrid, ray_marching, rendering
+from nerfacc import ContractionType, OccupancyGrid, ray_marching, rendering, ray_aabb_intersect
 
 
 class VarianceNetwork(nn.Module):
@@ -38,10 +38,23 @@ class NeuSModel(BaseModel):
         self.randomized = self.config.randomized
         self.register_buffer('background_color', torch.as_tensor([1.0, 1.0, 1.0], dtype=torch.float32), persistent=False)
         self.render_step_size = 1.732 * 2 * self.config.radius / self.config.num_samples_per_ray
+
+        self.bg_geometry = models.make(self.config.bg_geometry.name, self.config.bg_geometry)
+        self.bg_texture = models.make(self.config.bg_texture.name, self.config.bg_texture)
+        self.register_buffer('bg_aabb', torch.as_tensor([-self.config.bg_radius, -self.config.bg_radius, -self.config.bg_radius,
+            self.config.bg_radius, self.config.bg_radius, self.config.bg_radius], dtype=torch.float32))
+        if self.config.grid_prune:
+            self.bg_occupancy_grid = OccupancyGrid(
+                roi_aabb = self.scene_aabb * 3.0,
+                resolution = 128,
+                contraction_type=ContractionType.UN_BOUNDED_SPHERE
+                )
+        self.bg_render_step_size = 1.732 * 2 * self.config.bg_radius / self.config.bg_num_samples_per_ray
     
     def update_step(self, epoch, global_step):
         # progressive viewdir PE frequencies
         update_module_step(self.texture, epoch, global_step)
+        update_module_step(self.bg_texture, epoch, global_step)
 
         cos_anneal_end = self.config.get('cos_anneal_end', 0)
         self.cos_anneal_ratio = 1.0 if cos_anneal_end == 0 else min(1.0, global_step / cos_anneal_end)
@@ -61,6 +74,14 @@ class NeuSModel(BaseModel):
         
         if self.training and self.config.grid_prune:
             self.occupancy_grid.every_n_step(step=global_step, occ_eval_fn=occ_eval_fn)
+
+        def occ_eval_fn_bg(x):
+            density, _ = self.bg_geometry(x)
+            # approximate for 1 - torch.exp(-density[...,None] * self.render_step_size) based on taylor series
+            return density[...,None] * self.bg_render_step_size
+
+        if self.training and self.config.grid_prune:
+            self.bg_occupancy_grid.every_n_step(step=global_step, occ_eval_fn=occ_eval_fn_bg)
 
     def isosurface(self):
         mesh = self.geometry.isosurface()
@@ -93,6 +114,16 @@ class NeuSModel(BaseModel):
     def forward_(self, rays):
         rays_o, rays_d = rays[:, 0:3], rays[:, 3:6] # both (N_rays, 3)
 
+        # with torch.no_grad():
+        # compute t_starts_bg and t_ends_bg
+        intersect_min, intersect_max = ray_aabb_intersect(rays_o, rays_d, self.scene_aabb)
+        rays_o_bg = rays_o.clone()
+        # print("intersect_max shape: {}, rays_o shape: {}".format(intersect_max.shape, rays_o.shape))
+
+        intersect_mask = intersect_max < 1e10
+        print(torch.sum(intersect_mask))
+        rays_o_bg[intersect_mask] = (rays_o + intersect_max[..., None] * rays_d)[intersect_mask]
+
         sdf_grad_samples = []
 
         def alpha_fn(t_starts, t_ends, ray_indices):
@@ -122,7 +153,7 @@ class NeuSModel(BaseModel):
             return rgb, alpha[...,None]
 
         with torch.no_grad():
-            packed_info, t_starts, t_ends = ray_marching(
+            ray_indices, t_starts, t_ends = ray_marching(
                 rays_o, rays_d,
                 scene_aabb=self.scene_aabb,
                 grid=self.occupancy_grid if self.config.grid_prune else None,
@@ -134,13 +165,65 @@ class NeuSModel(BaseModel):
                 alpha_thre=0.0
             )
 
+            # print("t_starts shape: {}, t_ends shape: {}, ray_indices shape: {}".format(t_starts.shape, t_ends.shape, ray_indices.shape))
+            # t_starts shape: M x 1
+            # t_ends shape: M x 1
+            # ray_indices shape: M
+
         rgb, opacity, depth = rendering(
-            packed_info,
             t_starts,
             t_ends,
+            ray_indices,
+            n_rays=rays_d.shape[0],
             rgb_alpha_fn=rgb_alpha_fn,
-            render_bkgd=self.background_color,
+            render_bkgd=None,
         )
+
+        # background
+        def sigma_fn_bg(t_starts, t_ends, ray_indices):
+            ray_indices = ray_indices.long()
+            t_origins = rays_o_bg[ray_indices]
+            t_dirs = rays_d[ray_indices]
+            positions = t_origins + t_dirs * (t_starts + t_ends) / 2.
+            density, _ = self.bg_geometry(positions)
+            return density[...,None]
+
+        def rgb_sigma_fn_bg(t_starts, t_ends, ray_indices):
+            ray_indices = ray_indices.long()
+            t_origins = rays_o_bg[ray_indices]
+            t_dirs = rays_d[ray_indices]
+            positions = t_origins + t_dirs * (t_starts + t_ends) / 2.
+            density, feature = self.bg_geometry(positions)
+            rgb = self.bg_texture(feature, t_dirs)
+            return rgb, density[...,None]
+
+        with torch.no_grad():
+            ray_indices_bg, t_starts_bg, t_ends_bg = ray_marching(
+                rays_o_bg, rays_d,
+                scene_aabb=self.bg_aabb,
+                grid=self.bg_occupancy_grid if self.config.grid_prune else None,
+                sigma_fn=sigma_fn_bg,
+                near_plane=None, far_plane=None,
+                render_step_size=self.bg_render_step_size,
+                stratified=self.randomized,
+                cone_angle=0.0,
+                alpha_thre=0.0
+            )
+
+        rgb_bg, opacity_bg, depth_bg = rendering(
+            t_starts_bg,
+            t_ends_bg,
+            ray_indices_bg,
+            n_rays=rays_d.shape[0],
+            rgb_sigma_fn=rgb_sigma_fn_bg,
+            render_bkgd=self.background_color
+        )
+
+        rgb = rgb * opacity + rgb_bg * (1.0 - opacity) * opacity_bg
+        opacity = opacity + (1.0 - opacity) * opacity_bg
+        rgb = rgb / (opacity + 1e-5)
+
+        depth = torch.min(depth, depth_bg)
 
         sdf_grad_samples = torch.cat(sdf_grad_samples, dim=0)
         opacity, depth = opacity.squeeze(-1), depth.squeeze(-1)
@@ -150,7 +233,10 @@ class NeuSModel(BaseModel):
             'opacity': opacity,
             'depth': depth,
             'rays_valid': opacity > 0,
-            'num_samples': torch.as_tensor([len(t_starts)], dtype=torch.int32, device=rays.device)
+            'num_samples': torch.as_tensor([len(t_starts) + len(t_starts_bg)], dtype=torch.int32, device=rays.device),
+            'comp_rgb_bg': rgb_bg,
+            'opacity_bg': opacity_bg,
+            'depth_bg': depth_bg
         }
 
         if self.training:
@@ -182,5 +268,9 @@ class NeuSModel(BaseModel):
         losses = {}
         losses.update(self.geometry.regularizations(out))
         losses.update(self.texture.regularizations(out))
+
+        losses.update(self.bg_geometry.regularizations(out))
+        losses.update(self.bg_texture.regularizations(out))
+
         return losses
 
